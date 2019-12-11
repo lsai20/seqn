@@ -11,15 +11,36 @@ import pickle
 
 import torch
 import torch.nn as nn
-#from torch.autograd import Variable
-#from torch import optim
-#import torch.nn.functional as F
+from torch.autograd import Variable
+from torch import optim
+import torch.nn.functional as F
 #from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 #from torch.nn.init import xavier_uniform_
 from torch.utils.data import DataLoader, Dataset
 
 import argparse
-import torch
+
+from tqdm import tqdm, trange
+from scipy.sparse import coo_matrix # not useful for 3d array
+
+import sklearn.metrics
+
+import logging
+logger = logging.getLogger(__name__)
+
+# coo sparse matrix
+# read in mat once, then save as sparse matrix
+# loading sparse matrix very fast, converting back to numpy is also fast with toarray()
+# can load in sparse, then convert each batch to numpy
+
+
+# TODO add logging
+# TODO check code matches the lua, e.g. L1, num epochs
+
+# comments on Deepsea data:
+#  919 marks include 690 TF binding profiles (for 160 TFs), 125 DHS profiles, 104 histone-mark profiles
+# 17% of genome bound by at least one measured TF, unclear if they only used that 17% for training
+
 
 def parseargs():
 	parser = argparse.ArgumentParser(description='Training deepsea model')
@@ -27,16 +48,23 @@ def parseargs():
 	# misc flags
 	parser.add_argument('--disable_cuda', action='store_true', help='Disable CUDA')
 	parser.add_argument('--verbose', action='store_true', help='Print additional status messages to console')
-
-	# TODO specify logger or logging
-
+	parser.add_argument('--mini_data_set', action='store_true', help='load test data instead of full train set for debugging TODO')
 	# specify data
 	parser.add_argument('--data_mat_dir', type=str, default='deepsea_train/', help='Directory for DeepSea data in original .mat format')
+	parser.add_argument('--output_dir', type=str, default='deepsea_output/', help='Directory containing sparse matrices of data')
+
+	# option to load pretrained statedict 
+	# could also add option to save checkpoint instead of savedict
+	parser.add_argument('--load_statedict_name', type=str, default = None, help = 'Pretrained statedict to load.')
+
 
 	# training settings, defaults based on deepsea settings in run.sh or main.lua
 	parser.add_argument('--batch_size', type=int, default=16, help='mini-batch size')
 	parser.add_argument('--epoch_size', type=int, default=110000, help='By default, deepsea cycles through subset of data. If negative, cycle through entire training data each epoch. TODO')
-	parser.add_argument('--num_epochs', type=int, default=200, help='max num of epochs')
+	parser.add_argument('--num_train_epochs', type=int, default=300, help='max num of epochs if loss not decreasing')
+
+	# evaluation settings
+	parser.add_argument('--eval_batch_size', type=int, default=16, help='test/validation batch size')
 
 	# optimization settings, defaults based on deepsea
 	parser.add_argument('--learning_rate', type=float, default=1, help='Initial learning rate')
@@ -50,35 +78,40 @@ def parseargs():
 	args = parser.parse_args()
 	return args
 
-# TODO do i need to pass these parts of model to cuda? e.g. nn.conv1d(...).cuda() 
 
 
 class SeqDataset(Dataset):
-	def __init__(self, matFile, args=None):
+	def __init__(self, datasetName, matFile=None, args=None):
 
 		self.args = args
-		self.config = config
 
 		# load data from .mat (train, test, or valid)
-		# self.labels1hot is 1 hot of 919 features for each sample
-		# self.inputs1hot is 1 hot of ACGT for each sample, dim (num seq, seq len, 4)
+		# self.labels1hot is 1 hot of 919 features for each sample, e.g. (N, 919)
+		# self.inputs1hot is 1 hot of ACGT for each sample, dim (num seq, 4, seq len), e.g. (N, 1000, 4)
 		
-		datasetName = matFile.rsplit('/')[-1].split('.')[0]
-		try: # test.mat and valid.mat are MATLAB 5.0 file
-			print('loading %s as matlab file' % datafile)
-			datamat = scipy.io.loadmat(datafile)
-			self.labels1hot = datamat[datasetName + 'data']
-			self.inputs1hot = datamat[datasetName + 'xdata']
-		except NotImplementedError: # train.mat is MATLAB 7.3 file
-			# use HDF reader for matlab v7.3 files
-			# get array from HDF5 dataset  with [::]
-			print('try opening data as h5df')
-			f = h5py.File(datafile, 'r')
-			self.labels1hot = f[datasetName + 'data'][::]
-			self.inputs1hot = f[datasetName + 'xdata'][::]
-			f.close()		
+		if matFile:
+			# datasetName is train/test/valid
+			datasetName = matFile.rsplit('/')[-1].split('.')[0]
+			try: # test.mat and valid.mat are MATLAB 5.0 file
+				print('loading %s as matlab file' % matFile)
+				datamat = scipy.io.loadmat(matFile)
+				self.labels1hot = datamat[datasetName + 'data']
+				self.inputs1hot = datamat[datasetName + 'xdata']
+			except NotImplementedError: 
+				# train.mat is MATLAB 7.3 file so use HDF reader
+				# get array from HDF5 dataset	with [::]
+				# note: dim of train.mat is (seq len, 4, num seq) and (919, num seq), so need to transpose
+				print('try opening data as h5df')
+				f = h5py.File(matFile, 'r')
+				self.labels1hot = f[datasetName + 'data'][::].transpose()
+				self.inputs1hot = f[datasetName + 'xdata'][::].transpose((2,1,0))
+				f.close()
 
 		
+		else:
+			print('Must provide location of data as .mat or coo matrix')
+			exit(1)
+
 		self.seqlen = self.inputs1hot.shape[1] # length of seq window
 		# could add option to trim input to desired size
 
@@ -143,7 +176,7 @@ class DeepSeaModel (nn.Module):
 
 	def forward(self, x):
 		# could also return a tuple,l like hugging face
-		return self.deepsea_cnn(x)
+		return self.all_layers(x)
 			# should return prediction
 			# take derivative of loss in backward, binary loss
 
@@ -167,55 +200,217 @@ def train(model, train_dataset, valid_dataset, args):
 	'''
 
 	# DeepSea uses SGD with momentum
-	# TODO max kernel norm and l1 penaltyyyy
-	optimizer = optim.SGD(model.parameters(), lr = args.learning_rate, momentum = args.momentum, weight_decay = args.weight_decay)
-	# TODO do i need a scheduler? 
-	
+	# TODO max kernel norm and l1 penalty
+	#optimizer = optim.SGD(model.parameters(), lr = args.learning_rate, momentum = args.momentum, weight_decay = args.weight_decay)
+	optimizer = optim.Adam(model.parameters(), lr=0.0001)
+
 
 	# Note: deepsea shuffles data every epoch. Currently doing plain training
-	num_batches = int(len(train_dataset) / float(batch_size)) + 1
-	train_loader = torch.utils.data.DataLoader(train_dataset,
-		batch_size = args.batch_size, shuffle = True, num_workers = 4)
+	num_batches = int(len(train_dataset) / float(args.batch_size)) + 1
+	train_dataloader = torch.utils.data.DataLoader(train_dataset,
+		batch_size = args.batch_size, 
+		shuffle = True, 
+		num_workers = 4)
+
+	loss_fxn = nn.BCELoss() # . deepsea train uses BCE for multilabel, in 3_loss.lua. could add arg for loss function, or make loss part of the model class
+			
 
 	model.train(); model.zero_grad() # set to training mode, clear gradient
 	tr_loss = 0.0	# training loss
 
-	train_iterator = trange(int(args.num_train_epochs), desc="Epoch")
+	logger.info("***** Running training *****")
+	logger.info("	Num examples = %d", len(train_dataset))
+	logger.info("	Num Epochs = %d", args.num_train_epochs)
+	
+	# save args, set up dir for saving statedicts (could save checkpoints and args for each checkpoint?)
+	torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
+	if not os.path.exists(args.output_dir):
+			os.makedirs(args.output_dir)
 
+
+	## track best loss on valid set 
+	best_eval_loss = np.inf
+	last_best = 0
+	break_early = False
+
+	train_iterator = trange(int(args.num_train_epochs), desc="Epoch")
 	for epoch in train_iterator:
 
 		epoch_iterator = tqdm(train_dataloader, desc="Iteration")
 
 		current_loss = 0
 		num_batches_done = 0
+		tr_loss = 0.0	# training loss
+		logging_loss = 0.0 # ???
+		global_step = 0.0 # how many samples actually done in batch (?)
 
+		# note: the 1 hots inputs are ByteTensors, either make SeqDataset as float or convert batch by batch
+		# BCE loss expects labels to be float, CE expects Long
 		for step, batch in enumerate(epoch_iterator):
-			inputs = inputs.to(args.device)
-			labels = labels.to(args.device)
+			if step > args.epoch_size: # cycle through subset of data each epoch
+				break
+
+			labels = batch[0].float().to(args.device)
+			inputs = batch[1].float().to(args.device)
+
 			outputs = model(inputs) # forward
-			loss = nn.CrossEntropyLoss(outputs, labels) # backward 
+			loss = loss_fxn(outputs, labels) # backward 
 			loss.backward()
-			optimizer.step() # optimization
+			optimizer.step() # update based on grad
 			model.zero_grad()
 
 			tr_loss += loss.item()
 
 			num_batches_done += 1
-			print('epoch, batch', epoch, num_batches_done)
-			print('outputs', outputs)
-			print('tr_loss', tr_loss)
-		
+			global_step += 1 # not sure if this is right
+
 		# end-of-epoch report
-		# training loss, LATER: train_acc, valid_loss, valid_acc
+		# training loss, LATER: train_pr/f1, valid_loss, valid_pr/f1
+		print('\n\n\n\n\n\n\n\nepoch %d, tr_loss/batch_size %f' % (epoch, tr_loss/global_step))
+
+		print('\n\n\n\n\n\nTraining evaluate')
+		result_tr = evaluate(model, train_dataset, args, prefix="%d_%d" % (epoch, global_step))
+		tr_loss2, tr_f1_by_label, tr_roc_auc_by_label = result_tr
+
+		result_eval = evaluate(model, valid_dataset, args, prefix="%d_%d" % (epoch, global_step))
+		eval_loss, eval_f1_by_label, eval_roc_auc_by_label = result_eval
+		
+		print('\n\n\n\n\n\nValidation evaluate')
+		# currently print f1 and roc_auc in evaluate fxn
+		# could also save to file
+		
+		print('\n\n\n\ntrain, valid loss %f, %f' % (tr_loss/global_step, eval_loss) )
+		# save statedict
+		#model_to_save.save_pretrained(output_dir) #??? huggingface?
+		torch.save(model.state_dict(), os.path.join(args.output_dir, 'training_statedict_epoch_%d.dict' % (epoch) ))
+	
+		logger.info("Saving model statedict (not checkpoint?) to %s", args.output_dir)
 
 
-	return global_step, tr_loss
+		if eval_loss < best_eval_loss:
+			best_eval_loss = eval_loss
+			last_best = epoch
+			break_early = False
+			print ('\nupdate lowest loss: epoch {}, loss {}\nreset break_early to False, see break_early variable {}'.format(epoch,best_eval_loss,break_early))
+			torch.save(model.state_dict(), os.path.join(args.output_dir, 'best_training_statedict_epoch_%d.dict' % (epoch) ))
+
+			logger.info("Saving model statedict (not checkpoint?) to %s", args.output_dir)
+
+		else:
+			if epoch - last_best > 10 : ## break counter after some epoch, changed from 3 to 10
+				break_early = True
+				print ('epoch {} set break_early to True, see break_early variable {}'.format(epoch,break_early))
+
+		if break_early:
+			train_iterator.close()
+			print ("**** break early ****")
+			break
+
+
+	# tf is global_step
+	return tr_loss
 
 
 
-def evaluate(model, eval_data, args):
+def evaluate(model, eval_dataset, args, prefix=""):
 	'''evaluate model, e.g. on validation or test data'''
-	return
+
+	eval_output_dir = args.output_dir
+
+	if not os.path.exists(eval_output_dir):
+		#os.makedirs(eval_output_dir)
+		print('Specified output dir doesn\'t exist: %s' % args.output_dir)
+		exit(1)
+	
+	# Note that DistributedSampler samples randomly
+	#eval_sampler = SequentialSampler(eval_dataset) # may not even need sampler
+
+	eval_dataloader = DataLoader(eval_dataset, batch_size=args.eval_batch_size)
+
+	logger.info("***** Running evaluation {} *****".format(prefix))
+	logger.info("	Num examples = %d", len(eval_dataset))
+	logger.info("	Batch size = %d", args.eval_batch_size)
+	eval_loss = 0.0
+	model.eval()
+
+
+	loss_fxn = nn.BCELoss() # . deepsea train uses BCE for multilabel, in 3_loss.lua. could add arg for loss function, or make loss part of the model class
+
+	nb_eval_steps = 0.0
+	num_samples_so_far = 0
+	# TODO step, batch?
+	all_outputs = np.zeros_like(eval_dataset.labels1hot)
+
+	for batch in tqdm(eval_dataloader, desc="Evaluating"):
+		# convert byte to float
+		labels = batch[0].float().to(args.device)
+		inputs = batch[1].float().to(args.device)
+
+		with torch.no_grad():
+			outputs = model(inputs)
+			eval_loss += loss_fxn(outputs, labels).item()
+
+		
+		# can use dat/huggingface evaluation metric to get pr@k
+
+		# append outputs for this batch
+		i1 =  num_samples_so_far
+		i2 = num_samples_so_far + len(labels)
+		all_outputs[i1:i2,:] = outputs.cpu() # all_outputs is np arr
+		num_samples_so_far += len(labels)
+
+		nb_eval_steps += 1
+		#if nb_eval_steps > 10: # TODO
+		#	break
+
+	eval_loss = eval_loss / nb_eval_steps # normalize by num samples
+	all_labels = eval_dataset.labels1hot
+	# note that sklearn requires numpy, not tensor
+
+	# compute f1 and roc_auc for each label
+	# (could compute all at once and average, but sklearn.metrics throws error for labels with only one class)
+	eval_f1_by_label = np.zeros(919)
+	eval_roc_auc_by_label = np.zeros(919)
+
+
+	print('\neval_loss')
+	print(eval_loss)
+	print('(micro) mean eval_f1')
+	print(np.mean(eval_f1_by_label))
+	print('(micro) mean eval_roc_auc')
+	print(np.mean(eval_roc_auc_by_label))
+
+	print('num pos per class, true')
+	print(sum(all_labels))
+	print('num pos per class, predicted')
+	print(sum(all_outputs))
+	print('\n')
+
+
+	for marker_idx in range(919):
+		# check for case with only one class
+		num1s = sum(all_labels[:,marker_idx])
+		if  num1s == 0 or num1s == 919: 
+			eval_f1_by_label[marker_idx] = np.nan
+			eval_roc_auc_by_label[marker_idx] = np.nan
+
+
+		else:
+			#print('line 386 sums:')
+			#print( sklearn.metrics.f1_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average='binary') )
+			#print( sklearn.metrics.roc_auc_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average=None) )
+			#print('\n\n\n\n')
+
+			# if no positive predictions, f1 set to 0 (sklearn 0.22 has option zero_division=0 for warnings surpressed)
+			eval_f1_by_label[marker_idx] = sklearn.metrics.f1_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average='binary')
+
+			eval_roc_auc_by_label[marker_idx] = sklearn.metrics.roc_auc_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average=None)
+
+	# could also add option to save predictions and metrics
+
+	return eval_loss, eval_f1_by_label, eval_roc_auc_by_label
+
+
 
 
 def main():
@@ -230,25 +425,80 @@ def main():
 	print('Using device: %s' % args.device)
 	
 	
-	##### DATA #####
-	# comments: 919 marks include 690 TF binding profiles (for 160 TFs), 125 DHS profiles, 104 histone-mark profiles
-	# 17% of genome bound by at least one measured TF, unclear if they only used that 17% for training
-	train_dataset = SeqDataset(os.path.join(args.data_mat_dir, 'train.mat'))
-	valid_dataset = SeqDataset(os.path.join(args.data_mat_dir, 'valid.mat'))
-
-
-	##### INITIALIZE MODEL #####
-	deepsea_model = DeepSeaModel()
-	#if not args.disable_cuda:
-	#	deepsea_model.cuda() # move to gpu before making optimizer
-
-
-	##### TRAIN #####
-	train(model, train_dataset, valid_dataset, args)
-	
 
 
 
+
+	#### LOAD PRETRAINED MODEL AND EVALUATE ####
+		# load saved model and test data only
+	# could also check automatically if model ends with .pt or .pth
+
+	test_dataset = SeqDataset('test', matFile = os.path.join(args.data_mat_dir, 'test.mat'))
+	print('test_dataset input and label shapes')
+	print(test_dataset.inputs1hot.shape)
+	print(test_dataset.labels1hot.shape)
+
+	print('\n\n\n\n\n', flush=True)
+
+
+	if args.load_statedict_name:
+		# get architecture, reset final layer to one output for each class
+		deepsea_model = DeepSeaModel()
+		if not args.disable_cuda:
+			deepsea_model.cuda()
+
+		deepsea_model.load_state_dict(torch.load(args.load_statedict_name))
+
+		if args.verbose:
+			print('Loaded saved model from state dict')
+
+
+	# Else load train data and train
+	elif args.load_statedict_name == None or args.load_statedict_name == '':
+		##### TRAIN/VALID DATA AND TEST #####
+
+
+
+		if args.mini_data_set:
+			train_dataset = SeqDataset('test',  matFile = os.path.join(args.data_mat_dir, 'test.mat'))
+
+		else:
+			train_dataset = SeqDataset('train', matFile = os.path.join(args.data_mat_dir, 'train.mat'))
+
+		print('\ntrain_dataset input and label shapes')
+		print(train_dataset.inputs1hot.shape)
+		print(train_dataset.labels1hot.shape)
+		
+		valid_dataset = SeqDataset('valid',  matFile = os.path.join(args.data_mat_dir, 'valid.mat'))
+		print('\nvalid_dataset input and label shapes')
+		print(valid_dataset.inputs1hot.shape)
+		print(valid_dataset.labels1hot.shape)
+
+		test_dataset = SeqDataset('test',  matFile = os.path.join(args.data_mat_dir, 'test.mat'))
+		print('\ntest_dataset input and label shapes')
+		print(test_dataset.inputs1hot.shape)
+		print(test_dataset.labels1hot.shape)
+
+		print('\n\n\n\n\n', flush=True)
+
+
+		##### INITIALIZE MODEL AND TRAIN #####
+		# currently save best-so-far model during train(...)
+		deepsea_model = DeepSeaModel()
+		if not args.disable_cuda:
+			deepsea_model.cuda() # move to gpu before making optimizer
+
+		train(deepsea_model, train_dataset, valid_dataset, args)
+			
+
+
+	#### RUN ON TEST DATA ####
+	deepsea_model.eval() # set to evaluation mode
+	evaluate(deepsea_model, test_dataset, args, prefix="")
+
+
+
+'''
 	# input a batch
 	x = torch.FloatTensor(test_mat['testxdata'][0]).unsqueeze(0)
 	print('x shape', x.shape, x[0:3])
@@ -260,6 +510,7 @@ def main():
 	print(deepsea_model.deepsea_cnn[0].weight.grad)
 	print(y.shape)
 	print(y)
+'''
 
 
 if __name__ == '__main__':
