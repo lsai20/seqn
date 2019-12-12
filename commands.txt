@@ -1,0 +1,3 @@
+CUDA_VISIBLE_DEVICES=7 python3 model_deepsea_pytorch.py --batch_size 64 --eval_batch_size 64 --adam_learning_rate 0.001 --mini_data_set 2>&1 | tee dec11_lr0.001_adam.txt
+
+CUDA_VISIBLE_DEVICES=7 python3 model_deepsea_pytorch.py --batch_size 64 --eval_batch_size 64 --adam_learning_rate 0.001 --mini_data_set > | tee dec11_lr0.001_adam.txt

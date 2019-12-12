@@ -28,11 +28,6 @@ import sklearn.metrics
 import logging
 logger = logging.getLogger(__name__)
 
-# coo sparse matrix
-# read in mat once, then save as sparse matrix
-# loading sparse matrix very fast, converting back to numpy is also fast with toarray()
-# can load in sparse, then convert each batch to numpy
-
 
 # TODO add logging
 # TODO check code matches the lua, e.g. L1, num epochs
@@ -68,6 +63,8 @@ def parseargs():
 
 	# optimization settings, defaults based on deepsea
 	parser.add_argument('--learning_rate', type=float, default=1, help='Initial learning rate')
+	parser.add_argument('--adam_learning_rate', type=float, default=0.0001, help='Initial learning rate')
+
 	parser.add_argument('--learning_rate_decay', type=float, default = 8e-7)
 	parser.add_argument('--weight_decay', type=float, default = 2 * 5e-7, help='Weight decay for SGD, equal to 2 * L2')
 	parser.add_argument('--momentum', type=float, default=0.9, help='momentum for SGD')
@@ -89,7 +86,13 @@ class SeqDataset(Dataset):
 		# self.labels1hot is 1 hot of 919 features for each sample, e.g. (N, 919)
 		# self.inputs1hot is 1 hot of ACGT for each sample, dim (num seq, 4, seq len), e.g. (N, 1000, 4)
 		
-		if matFile:
+		if not matFile:
+			print('Initializing empty SeqDataset obj')
+			self.labels1hot = None
+			self.inputs1hot = None
+			self.seqlen = None
+
+		else:
 			# datasetName is train/test/valid
 			datasetName = matFile.rsplit('/')[-1].split('.')[0]
 			try: # test.mat and valid.mat are MATLAB 5.0 file
@@ -107,13 +110,9 @@ class SeqDataset(Dataset):
 				self.inputs1hot = f[datasetName + 'xdata'][::].transpose((2,1,0))
 				f.close()
 
-		
-		else:
-			print('Must provide location of data as .mat or coo matrix')
-			exit(1)
-
 		self.seqlen = self.inputs1hot.shape[1] # length of seq window
 		# could add option to trim input to desired size
+
 
 	def __len__(self): # number of samples in dataset
 		return len(self.labels1hot)
@@ -154,13 +153,13 @@ class DeepSeaModel (nn.Module):
 			nn.Threshold(0, self.threshold),
 
 			nn.MaxPool1d(4, 4), 
-			nn.Dropout(p=0.2),
+			nn.Dropout(p = 0.2),
 
 			nn.Conv1d(320, 480, 8, stride=1),
 			nn.Threshold(0, self.threshold),
 
 			nn.MaxPool1d(4, 4),
-			nn.Dropout(p=0.2),
+			nn.Dropout(p = 0.2),
 
 			nn.Conv1d(480, 960, 8, stride=1),	
 			nn.Threshold(0, self.threshold),
@@ -202,18 +201,19 @@ def train(model, train_dataset, valid_dataset, args):
 	# DeepSea uses SGD with momentum
 	# TODO max kernel norm and l1 penalty
 	#optimizer = optim.SGD(model.parameters(), lr = args.learning_rate, momentum = args.momentum, weight_decay = args.weight_decay)
-	optimizer = optim.Adam(model.parameters(), lr=0.0001)
+	optimizer = optim.Adam(model.parameters(), lr=args.adam_learning_rate)
 
 
 	# Note: deepsea shuffles data every epoch. Currently doing plain training
 	num_batches = int(len(train_dataset) / float(args.batch_size)) + 1
+
+
 	train_dataloader = torch.utils.data.DataLoader(train_dataset,
 		batch_size = args.batch_size, 
 		shuffle = True, 
 		num_workers = 4)
 
-	loss_fxn = nn.BCELoss() # . deepsea train uses BCE for multilabel, in 3_loss.lua. could add arg for loss function, or make loss part of the model class
-			
+	loss_fxn = nn.BCELoss() # . deepsea train uses BCE for multilabel
 
 	model.train(); model.zero_grad() # set to training mode, clear gradient
 	tr_loss = 0.0	# training loss
@@ -222,7 +222,7 @@ def train(model, train_dataset, valid_dataset, args):
 	logger.info("	Num examples = %d", len(train_dataset))
 	logger.info("	Num Epochs = %d", args.num_train_epochs)
 	
-	# save args, set up dir for saving statedicts (could save checkpoints and args for each checkpoint?)
+	# save args, set up dir for saving statedicts (or checkpoints)
 	torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 	if not os.path.exists(args.output_dir):
 			os.makedirs(args.output_dir)
@@ -234,21 +234,25 @@ def train(model, train_dataset, valid_dataset, args):
 	break_early = False
 
 	train_iterator = trange(int(args.num_train_epochs), desc="Epoch")
+
+	global_step = 0.0 # how many batches total across epochs
+
 	for epoch in train_iterator:
 
-		epoch_iterator = tqdm(train_dataloader, desc="Iteration")
+		epoch_iterator = tqdm(train_dataloader, desc="Epoch%dTrainIteration" % epoch)
 
 		current_loss = 0
 		num_batches_done = 0
 		tr_loss = 0.0	# training loss
 		logging_loss = 0.0 # ???
-		global_step = 0.0 # how many samples actually done in batch (?)
+
 
 		# note: the 1 hots inputs are ByteTensors, either make SeqDataset as float or convert batch by batch
 		# BCE loss expects labels to be float, CE expects Long
 		for step, batch in enumerate(epoch_iterator):
-			if step > args.epoch_size: # cycle through subset of data each epoch
-				break
+			#if step > args.epoch_size: # cycle through subset of data each epoch (messes up the iterator display to break early)
+			#print('reached epoch size, now evaluating')
+			#break
 
 			labels = batch[0].float().to(args.device)
 			inputs = batch[1].float().to(args.device)
@@ -257,34 +261,34 @@ def train(model, train_dataset, valid_dataset, args):
 			loss = loss_fxn(outputs, labels) # backward 
 			loss.backward()
 			optimizer.step() # update based on grad
-			model.zero_grad()
-
+			#model.zero_grad()
+			optimizer.zero_grad()
 			tr_loss += loss.item()
 
 			num_batches_done += 1
 			global_step += 1 # not sure if this is right
 
 		# end-of-epoch report
-		# training loss, LATER: train_pr/f1, valid_loss, valid_pr/f1
-		print('\n\n\n\n\n\n\n\nepoch %d, tr_loss/batch_size %f' % (epoch, tr_loss/global_step))
-
-		print('\n\n\n\n\n\nTraining evaluate')
-		result_tr = evaluate(model, train_dataset, args, prefix="%d_%d" % (epoch, global_step))
-		tr_loss2, tr_f1_by_label, tr_roc_auc_by_label = result_tr
-
-		result_eval = evaluate(model, valid_dataset, args, prefix="%d_%d" % (epoch, global_step))
-		eval_loss, eval_f1_by_label, eval_roc_auc_by_label = result_eval
-		
-		print('\n\n\n\n\n\nValidation evaluate')
 		# currently print f1 and roc_auc in evaluate fxn
-		# could also save to file
 		
-		print('\n\n\n\ntrain, valid loss %f, %f' % (tr_loss/global_step, eval_loss) )
+		print('\n#######################\nepoch %d, tr_loss/batch_size %f' % (epoch, tr_loss/args.batch_size))
+
+		# eval on training set is slow, either eval on sbuset or skit
+		#print('\nTraining evaluate')
+		#result_tr = evaluate(model, train_dataset, args, prefix="%d_%d" % (epoch, global_step), verbose=True)
+		#tr_loss2, tr_f1_by_label, tr_roc_auc_by_label, tr_avg_pr_by_label = result_tr
+
+		print('\nValidation evaluate')
+		result_eval = evaluate(model, valid_dataset, args, prefix="%d_%d" % (epoch, global_step), verbose=True, iterator_desc="Epoch_%d_evaluating" % epoch)
+		eval_loss, eval_f1_by_label, eval_roc_auc_by_label, eval_avg_pr_by_label = result_eval
+		
+		
+		print('\n\ntrain, valid loss %f, %f' % (tr_loss/global_step, eval_loss) )
 		# save statedict
 		#model_to_save.save_pretrained(output_dir) #??? huggingface?
+		logger.info("Saving model statedict (not checkpoint?) to %s", args.output_dir)
 		torch.save(model.state_dict(), os.path.join(args.output_dir, 'training_statedict_epoch_%d.dict' % (epoch) ))
 	
-		logger.info("Saving model statedict (not checkpoint?) to %s", args.output_dir)
 
 
 		if eval_loss < best_eval_loss:
@@ -297,7 +301,7 @@ def train(model, train_dataset, valid_dataset, args):
 			logger.info("Saving model statedict (not checkpoint?) to %s", args.output_dir)
 
 		else:
-			if epoch - last_best > 10 : ## break counter after some epoch, changed from 3 to 10
+			if epoch - last_best > 5 : ## break counter after some epoch, changed from 3 to 5
 				break_early = True
 				print ('epoch {} set break_early to True, see break_early variable {}'.format(epoch,break_early))
 
@@ -305,18 +309,20 @@ def train(model, train_dataset, valid_dataset, args):
 			train_iterator.close()
 			print ("**** break early ****")
 			break
+		
 
+		model.train(); # set back to training mode
+		print('Epoch %d end\n###################################\n\n\n', flush=True)
 
-	# tf is global_step
 	return tr_loss
 
 
-
-def evaluate(model, eval_dataset, args, prefix=""):
+# TODO use the evaluation prefix or get rid of arg
+def evaluate(model, eval_dataset, args, prefix="", verbose=False, iterator_desc="Evaluating"):
 	'''evaluate model, e.g. on validation or test data'''
 
 	eval_output_dir = args.output_dir
-
+	# TODO use the outputdir
 	if not os.path.exists(eval_output_dir):
 		#os.makedirs(eval_output_dir)
 		print('Specified output dir doesn\'t exist: %s' % args.output_dir)
@@ -339,9 +345,9 @@ def evaluate(model, eval_dataset, args, prefix=""):
 	nb_eval_steps = 0.0
 	num_samples_so_far = 0
 	# TODO step, batch?
-	all_outputs = np.zeros_like(eval_dataset.labels1hot)
+	all_outputs = np.zeros_like(eval_dataset.labels1hot, dtype=float)
 
-	for batch in tqdm(eval_dataloader, desc="Evaluating"):
+	for batch in tqdm(eval_dataloader, desc=iterator_desc):
 		# convert byte to float
 		labels = batch[0].float().to(args.device)
 		inputs = batch[1].float().to(args.device)
@@ -360,55 +366,73 @@ def evaluate(model, eval_dataset, args, prefix=""):
 		num_samples_so_far += len(labels)
 
 		nb_eval_steps += 1
-		#if nb_eval_steps > 10: # TODO
-		#	break
 
-	eval_loss = eval_loss / nb_eval_steps # normalize by num samples
+	eval_loss = eval_loss / (nb_eval_steps*args.eval_batch_size) # normalize by num samples
 	all_labels = eval_dataset.labels1hot
 	# note that sklearn requires numpy, not tensor
 
 	# compute f1 and roc_auc for each label
-	# (could compute all at once and average, but sklearn.metrics throws error for labels with only one class)
+	# (could compute all peak types at once and average, but sklearn.metrics throws error for labels with only one class)
 	eval_f1_by_label = np.zeros(919)
 	eval_roc_auc_by_label = np.zeros(919)
+	eval_avg_pr_by_label = np.zeros(919)
 
+	# round to get predictions at 0.5 thresh
+	all_outputs_rounded = np.rint(all_outputs).astype(int)
 
-	print('\neval_loss')
-	print(eval_loss)
-	print('(micro) mean eval_f1')
-	print(np.mean(eval_f1_by_label))
-	print('(micro) mean eval_roc_auc')
-	print(np.mean(eval_roc_auc_by_label))
-
-	print('num pos per class, true')
-	print(sum(all_labels))
-	print('num pos per class, predicted')
-	print(sum(all_outputs))
-	print('\n')
-
-
+	'''
+	if verbose:
+		print('\nnum pos per class, true')
+		print(sum(all_labels))
+		print('num pos per class, predicted')
+		print(sum(all_outputs))
+		print('num pos per class, predicted, rounded')
+		print(sum(all_outputs_rounded))
+		print('\n')
+	'''
+	if verbose:
+		print('\nmarker\tf1_score\troc_auc\tavg_pre')
+	
 	for marker_idx in range(919):
 		# check for case with only one class
 		num1s = sum(all_labels[:,marker_idx])
 		if  num1s == 0 or num1s == 919: 
+			if verbose:
+				print('No pos label, marker %d' % marker_idx ) 
 			eval_f1_by_label[marker_idx] = np.nan
 			eval_roc_auc_by_label[marker_idx] = np.nan
-
+			eval_avg_pr_by_label[marker_idx] = np.nan
 
 		else:
-			#print('line 386 sums:')
-			#print( sklearn.metrics.f1_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average='binary') )
-			#print( sklearn.metrics.roc_auc_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average=None) )
-			#print('\n\n\n\n')
+		# if no positive predictions, f1 set to 0 (sklearn 0.22 has option zero_division=0 for warnings surpressed). do it manual here for 0.21
+			if sum(all_outputs_rounded[:,marker_idx]) == 0:
+				eval_f1_by_label[marker_idx] = 0
+			else:
+				eval_f1_by_label[marker_idx] = sklearn.metrics.f1_score(all_labels[:,marker_idx], all_outputs_rounded[:,marker_idx], average='binary')
 
-			# if no positive predictions, f1 set to 0 (sklearn 0.22 has option zero_division=0 for warnings surpressed)
-			eval_f1_by_label[marker_idx] = sklearn.metrics.f1_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average='binary')
+			eval_roc_auc_by_label[marker_idx] = sklearn.metrics.roc_auc_score(all_labels[:,marker_idx], all_outputs[:,marker_idx])
+			eval_avg_pr_by_label[marker_idx] = sklearn.metrics.average_precision_score(all_labels[:,marker_idx], all_outputs[:,marker_idx])
 
-			eval_roc_auc_by_label[marker_idx] = sklearn.metrics.roc_auc_score(all_labels[:,marker_idx], all_outputs[:,marker_idx], average=None)
+			if verbose:
+				print('%d:\t%f\t%f\t%f' % (marker_idx, eval_f1_by_label[marker_idx], eval_roc_auc_by_label[marker_idx], eval_avg_pr_by_label[marker_idx]))
+	
+	# TODO add option to save outputs and metrics by peak type
+	if verbose:
+		print('\nLoss %f' % eval_loss)
+		#print('f1')
+		#print(eval_f1_by_label[0:5])
+		#print('auc')
+		#print(eval_roc_auc_by_label[0:5])
 
-	# could also add option to save predictions and metrics
+	#print('(micro) mean eval_f1')
+	#print(np.mean(eval_f1_by_label)) 
+	#print('(micro) mean eval_roc_auc')
+	#print(np.mean(eval_roc_auc_by_label))
 
-	return eval_loss, eval_f1_by_label, eval_roc_auc_by_label
+	# TODO also return avg_precision and give option to return or save predictions
+
+
+	return eval_loss, eval_f1_by_label, eval_roc_auc_by_label, eval_avg_pr_by_label
 
 
 
@@ -438,8 +462,6 @@ def main():
 	print(test_dataset.inputs1hot.shape)
 	print(test_dataset.labels1hot.shape)
 
-	print('\n\n\n\n\n', flush=True)
-
 
 	if args.load_statedict_name:
 		# get architecture, reset final layer to one output for each class
@@ -457,10 +479,11 @@ def main():
 	elif args.load_statedict_name == None or args.load_statedict_name == '':
 		##### TRAIN/VALID DATA AND TEST #####
 
-
-
 		if args.mini_data_set:
 			train_dataset = SeqDataset('test',  matFile = os.path.join(args.data_mat_dir, 'test.mat'))
+			# TODO add constructor for SeqDataset to init from array
+			train_dataset.labels1hot = train_dataset.labels1hot[2000:3000]
+			train_dataset.inputs1hot = train_dataset.inputs1hot[2000:3000]
 
 		else:
 			train_dataset = SeqDataset('train', matFile = os.path.join(args.data_mat_dir, 'train.mat'))
@@ -471,6 +494,10 @@ def main():
 		
 		valid_dataset = SeqDataset('valid',  matFile = os.path.join(args.data_mat_dir, 'valid.mat'))
 		print('\nvalid_dataset input and label shapes')
+		if args.mini_data_set:
+			valid_dataset.labels1hot = valid_dataset.labels1hot[0:1000]
+			valid_dataset.inputs1hot = valid_dataset.inputs1hot[0:1000]
+
 		print(valid_dataset.inputs1hot.shape)
 		print(valid_dataset.labels1hot.shape)
 
@@ -488,13 +515,18 @@ def main():
 		if not args.disable_cuda:
 			deepsea_model.cuda() # move to gpu before making optimizer
 
+		print('\n############# TRAINING ########################')
 		train(deepsea_model, train_dataset, valid_dataset, args)
 			
 
 
 	#### RUN ON TEST DATA ####
 	deepsea_model.eval() # set to evaluation mode
-	evaluate(deepsea_model, test_dataset, args, prefix="")
+	# TODO, temporarily set test data to be small, roc_roc and avg_pr very slow on server
+	test_dataset.labels1hot = test_dataset.labels1hot[0:10000]
+	test_dataset.inputs1hot = test_dataset.inputs1hot[0:10000]
+	print('\n############### EVAL ON 10k TEST SAMPLES #############', flush=True)
+	evaluate(deepsea_model, test_dataset, args, prefix="", verbose=True, iterator_desc="Evaluating Test")
 
 
 
@@ -511,6 +543,7 @@ def main():
 	print(y.shape)
 	print(y)
 '''
+
 
 
 if __name__ == '__main__':
